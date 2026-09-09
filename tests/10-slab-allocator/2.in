@@ -1,0 +1,5 @@
+CACHE_CREATE inode 64 2
+ALLOC inode
+ALLOC inode
+ALLOC inode
+STATS inode

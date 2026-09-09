@@ -1,0 +1,9 @@
+class=16
+OK
+16:alloc=0:free=1
+32:alloc=0:free=0
+64:alloc=0:free=0
+128:alloc=0:free=0
+256:alloc=0:free=0
+512:alloc=0:free=0
+1024:alloc=0:free=0

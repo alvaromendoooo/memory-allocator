@@ -1,0 +1,17 @@
+0
+16
+32
+48
+64
+80
+96
+112
+class=16 alloc=8 free=0
+class=32 alloc=0 free=0
+class=64 alloc=0 free=0
+class=128 alloc=0 free=0
+class=256 alloc=0 free=0
+class=512 alloc=0 free=0
+class=1024 alloc=0 free=0
+class=2048 alloc=0 free=0
+bump=128/32768
