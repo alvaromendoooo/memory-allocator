@@ -2,3 +2,5 @@
 *.class
 __pycache__/
 node_modules/
+src/
+Cargo.toml
