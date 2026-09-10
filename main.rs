@@ -1,4 +1,3 @@
-use std::fmt::format;
 use std::io::{self, BufRead};
 use std::str::FromStr;
 
@@ -89,13 +88,42 @@ impl Allocator {
 
     // Allocate memory that is free and suitable
     pub fn alloc(&mut self, request_size: i32) -> Result<i32, &'static str> {
-        for block in self.blocks.iter_mut() {
-            if block.status == Status::Free && block.size >= request_size {
+        // Find the index of the first free block large enough
+        let block_idx = self.blocks.iter().position(|b| {
+            b.status == Status::Free && b.size >= request_size
+        });
+
+        if let Some(idx) = block_idx {
+            let block = &mut self.blocks[idx]; // It's gonna be updated
+            let original_data_addr = block.data_address;
+            let original_data_size = block.size;
+            let remainder_size = original_data_size - request_size;
+
+            if remainder_size >= MIN_SPLIT {
+                // Split initial free block into used + free blocks
+                block.size = request_size;
                 block.status = Status::Used;
-                return Ok(block.data_address);
+
+                // Create the new free block due to used block appearance
+                let new_free_addr = original_data_addr + request_size;
+
+                let free_block = MemoryBlock {
+                    data_address: new_free_addr,
+                    size: remainder_size,
+                    status: Status::Free
+                };
+
+                // Add new free block into block registry, next to used block already registered
+                self.blocks.insert(idx + 1, free_block);
+            } else {
+                // Whole initial free block is gonna be used + it'll contains overflow
+                block.status = Status::Used;
             }
+
+            Ok(original_data_addr)
+        } else {
+            Err("OOM")
         }
-        Err("OOM")
     }
 
     // Frees used blocks of memory from data_adress
@@ -130,6 +158,7 @@ impl Allocator {
 
 
 const HEADER_SIZE: i32 = 8; // In this memory allocator, the header size is only 4
+const MIN_SPLIT: i32   = 16; // Minimum remaining size of unued block memory that determines split.
 
 fn main() {
     let stdin = io::stdin();
