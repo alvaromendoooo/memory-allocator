@@ -252,11 +252,12 @@ impl Allocator {
             let next_block_is_free = self.blocks[i + 1].status == Status::Free;
 
             if current_block_is_free && next_block_is_free {
-                // Remove the adjacent free block
-                let next_block = self.blocks.remove(i + 1);
-
-                // Merge size with current free block
-                self.blocks[i].size += next_block.size;
+                // Group payload size from adjacent blocks that are coalescing + OVERHEAD
+                let combined_payload = self.blocks[i].size + self.blocks[i+1].size + OVERHEAD;
+                // set new payload size to current coalesced block
+                self.blocks[i].size = combined_payload;
+                // remove adjacent block
+                self.blocks.remove(i + 1);
 
                 // No i increment needed because we removed one, so it will compare with the newly
                 // expanded
