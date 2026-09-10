@@ -10,6 +10,8 @@ pub enum AllowedInstructions {
     FREE,
     BLOCKS,
     FREELIST,
+    COUNT,
+    PREV,
 }
 
 #[derive(Debug, PartialEq)]
@@ -62,6 +64,8 @@ impl FromStr for AllowedInstructions {
             "FREE"     => Ok(AllowedInstructions::FREE),
             "BLOCKS"   => Ok(AllowedInstructions::BLOCKS),
             "FREELIST" => Ok(AllowedInstructions::FREELIST),
+            "PREV"     => Ok(AllowedInstructions::PREV),
+            "COUNT"    => Ok(AllowedInstructions::COUNT),
             _          => Err(ParseInstructionError),
         }
     }
@@ -143,10 +147,10 @@ impl Allocator {
     }
 
     // Create a new instance of Allocator with free data
-    pub fn init(heap_size: i32, hdr: i32) -> Self {
+    pub fn init(heap_size: i32, hdr: i32, ftr: i32) -> Self {
         let initial_free_block = MemoryBlock {
             data_address: hdr,
-            size: heap_size - hdr,
+            size: heap_size - hdr - ftr,
             status: Status::Free
         };
 
@@ -175,26 +179,29 @@ impl Allocator {
             let block = &mut self.blocks[idx]; // It's gonna be updated
             let original_data_addr = block.data_address;
             let original_data_size = block.size;
-            let remainder_size = original_data_size - request_size;
+            //calculate the total footprint of the newly allocated block (payload + tags)
+            let used_block_footprint = request_size + OVERHEAD;
 
-            if remainder_size >= MIN_SPLIT {
-                // Split initial free block into used + free blocks
+            if original_data_size >= used_block_footprint + MIN_SPLIT {
+                // split initial free block into used + free blocks
                 block.size = request_size;
                 block.status = Status::Used;
-
-                // Create the new free block due to used block appearance
-                let new_free_addr = original_data_addr + request_size;
+                
+                
+                // create the new free block due to used block appearance
+                let new_free_addr = original_data_addr + used_block_footprint;
+                let new_free_payload_size = original_data_size - used_block_footprint;
 
                 let free_block = MemoryBlock {
                     data_address: new_free_addr,
-                    size: remainder_size,
+                    size: new_free_payload_size,
                     status: Status::Free
                 };
 
-                // Add new free block into block registry, next to used block already registered
+                // add new free block into block registry, next to used block already registered
                 self.blocks.insert(idx + 1, free_block);
             } else {
-                // Whole initial free block is gonna be used + it'll contains overflow
+                // whole initial free block is gonna be used + it'll contains overflow
                 block.status = Status::Used;
             }
 
@@ -258,12 +265,41 @@ impl Allocator {
             }
         }
     }
+
+    // Looks for the previous block
+    pub fn prev(&self, check_from_addr: i32) -> String {
+        let block_idx = match self.blocks.iter()
+            .position(|b| b.data_address == check_from_addr) {
+            Some(idx) => idx,
+            None             => return "BAD".to_string(),
+        };
+
+        // If we are on the first block, there is noone behind
+        if block_idx == 0 {
+            return "NONE".to_string()
+        }
+
+        let previous_block = &self.blocks[block_idx - 1]; // O(1)
+        let formatted_status = match previous_block.status {
+            Status::Used => "used",
+            Status::Free => "free"
+        };
+        
+        format!("{}:{}:{}", previous_block.data_address, previous_block.size, formatted_status)
+    }
+
+    // Count total blocks in memory at this time
+    pub fn count(&self) -> String {
+        self.blocks.iter().count().to_string()
+    }
 }
 
 
 
-const HEADER_SIZE: i32 = 0; // In this memory allocator, the header size is only 4
-const MIN_SPLIT: i32   = 16; // Minimum remaining size of unued block memory that determines split.
+const HEADER_SIZE: i32    = 8; // In this memory allocator, the header size is only 8
+const FOOTER_SIZE: i32    = 8;
+const MIN_SPLIT: i32      = 16; // Minimum remaining size of unued block memory that determines split.
+const OVERHEAD: i32       = HEADER_SIZE + FOOTER_SIZE;
 
 fn main() {
     let stdin = io::stdin();
@@ -295,7 +331,7 @@ fn main() {
             Some(AllowedInstructions::INIT) => {
                 if let Some(size) = number {
                     let active_strat = strategy.unwrap_or(FitStrategies::FIRST);
-                    let allocator = Allocator::init(size, HEADER_SIZE);
+                    let allocator = Allocator::init(size, HEADER_SIZE, FOOTER_SIZE);
                     fit_strat_controller = Some(FitStratController::new(allocator, active_strat));
                     result.push("OK".to_string());
                 } else {
@@ -392,12 +428,26 @@ fn main() {
             Some(AllowedInstructions::BLOCKS) => {
                 if let Some(ctl) = &fit_strat_controller {
                     result.extend(ctl.allocator.print_blocks());
-                } 
+                }
             }
             Some(AllowedInstructions::FREELIST) => {
                 if let Some(ctl) = &fit_strat_controller {
                     result.extend(ctl.allocator.print_free_block());
-                } 
+                }
+            }
+            Some(AllowedInstructions::PREV) => {
+                if let (Some(ctl), Some(addr)) = (&fit_strat_controller, number) {
+                    result.push(ctl.allocator.prev(addr));
+                } else {
+                    println!("Inapropiate value for instruction INSERT, expected: num, got: {:?}", number);
+                    return;
+                }
+
+            }
+            Some(AllowedInstructions::COUNT) => {
+                if let Some(ctl) = &fit_strat_controller {
+                    result.push(ctl.allocator.count());
+                }
             }
             None => println!("Invalid or missing instruction"),
         }
