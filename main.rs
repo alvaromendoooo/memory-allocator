@@ -153,6 +153,33 @@ impl Allocator {
         }
         free_blocks_stringify
     }
+
+    // Coalesce consecutive free blocks innto a bigger one
+    pub fn coalesce(&mut self) {
+        // Base case
+        if self.blocks.len() < 2 {
+            return;
+        }
+
+        let mut i = 0; // index for block registry iteration
+        while i < self.blocks.len() - 1 {
+            let current_block_is_free = self.blocks[i].status == Status::Free;
+            let next_block_is_free = self.blocks[i + 1].status == Status::Free;
+
+            if current_block_is_free && next_block_is_free {
+                // Remove the adjacent free block
+                let next_block = self.blocks.remove(i + 1);
+
+                // Merge size with current free block
+                self.blocks[i].size += next_block.size;
+
+                // No i increment needed because we removed one, so it will compare with the newly
+                // expanded
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 
@@ -252,7 +279,10 @@ fn main() {
             Some(AllowedInstructions::FREE) => {
                 if let (alloc, Some(data_address)) = (&mut allocator, number) {
                     match alloc.free(data_address) {
-                        Ok(str) => result.push(str.to_string()),
+                        Ok(str) => {
+                            result.push(str.to_string());
+                            allocator.coalesce();
+                        },
                         Err(err) => result.push(err.to_string()),
                     }
                 } 
