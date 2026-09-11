@@ -12,6 +12,7 @@ pub enum AllowedInstructions {
     FREELIST,
     COUNT,
     PREV,
+    STATS,
 }
 
 #[derive(Debug, PartialEq)]
@@ -34,20 +35,29 @@ pub struct ParseInstructionError;
 // Definition of memory block components
 #[derive(Debug, Clone)]
 pub struct MemoryBlock {
-    data_address: i32,
-    size: i32,
-    status: Status,
+    pub data_address: i32,
+    pub size: i32,
+    pub status: Status,
+    pub class: Option<i32>
+}
+
+// Defiition of Classes for allocating memory
+pub struct Class {
+    pub sizes: Vec<i32>,
+    pub alloc_count: Vec<i32>,
+    pub free_count: Vec<i32>,
 }
 
 // Definition of allocator instance, contolling memory block registry
 pub struct Allocator {
-    blocks: Vec<MemoryBlock>,
+    pub blocks: Vec<MemoryBlock>,
+    pub class: Class,
 }
 
 // Definition of memory strategy allocator manager - Controls ALLOC depending of the strat
 pub struct FitStratController {
-    allocator: Allocator,
-    strat: FitStrategies
+    pub allocator: Allocator,
+    pub strat: FitStrategies
 }
 
 // Mapper that converts input str into enum for match iteration control
@@ -66,6 +76,7 @@ impl FromStr for AllowedInstructions {
             "FREELIST" => Ok(AllowedInstructions::FREELIST),
             "PREV"     => Ok(AllowedInstructions::PREV),
             "COUNT"    => Ok(AllowedInstructions::COUNT),
+            "STATS"    => Ok(AllowedInstructions::STATS),
             _          => Err(ParseInstructionError),
         }
     }
@@ -137,25 +148,42 @@ impl FitStratController {
     }
 }
 
+// Class functionalities
+impl Class {
+    // New instace
+    pub fn new() -> Self {
+        let sizes =  vec![16, 32, 64, 128, 256, 512, 1024];
+        let len = sizes.len();
+        Self {
+            sizes,
+            alloc_count: vec![0; len],
+            free_count:  vec![0; len],
+        }
+    }
+}
+
 // Allocator functionalities
 impl Allocator {
     // New instace
-    pub fn new() -> Self {
+    pub fn new(class_instance: Class) -> Self {
         Self {
             blocks: Vec::new(),
+            class: class_instance,
         }
     }
 
     // Create a new instance of Allocator with free data
-    pub fn init(heap_size: i32, hdr: i32, ftr: i32) -> Self {
+    pub fn init(heap_size: i32, hdr: i32, ftr: i32, class_instance: Class) -> Self {
         let initial_free_block = MemoryBlock {
             data_address: hdr,
             size: heap_size - hdr - ftr,
-            status: Status::Free
+            status: Status::Free,
+            class: None
         };
 
         Self {
             blocks: vec![initial_free_block],
+            class: class_instance,
         }
     }
 
@@ -171,23 +199,54 @@ impl Allocator {
         }
         blocks_stringify
     }
+    
+
+    // Get allocator's class indexes to alloc memory that is next to a power of 2 class - O(1) complexity
+    pub fn get_class_index(&self, request_size: i32) -> Option<usize> {
+        self.class.sizes.iter().position(|&c| c >= request_size) // If i want to alloc 57, it is
+        // indexed into a 64 class.
+    }
+
+    // Set block's class reference inside allocator's registry
+    pub fn set_class_in_box(&mut self, block_addr: i32, class_index: usize) {
+        if let Some(matched_block_idx) = self.blocks.iter().
+            position(|b| b.data_address == block_addr) {
+            let matched_block = &mut self.blocks[matched_block_idx];
+            matched_block.class = Some(self.class.sizes[class_index]);
+        }     
+    }
 
     // Allocate memory that is free and suitable
     pub fn alloc_by_idx(&mut self, request_size: i32, block_idx: Option<usize>) -> Result<i32, &'static str> {
-        
+        // Base case, more allocated size that default owned
+        if request_size > DEFAULT_HEAP_SIZE {
+            return Err("TOO_LARGE")
+        }
+
         if let Some(idx) = block_idx {
+            // Resolve class size
+            let class_idx = match self.get_class_index(request_size) {
+                Some(c) => c,
+                None    => return Err("TOO_LARGE"),
+            };
+            
+            let class_val = self.class.sizes[class_idx];
+            //calculate the total footprint of the newly allocated block (payload + tags) - taking
+            //into account that if request_size = 10 and is included in class 16, the size is 16 not 10
+            let used_block_footprint = class_val + OVERHEAD;
+
+
             let block = &mut self.blocks[idx]; // It's gonna be updated
             let original_data_addr = block.data_address;
             let original_data_size = block.size;
-            //calculate the total footprint of the newly allocated block (payload + tags)
-            let used_block_footprint = request_size + OVERHEAD;
-
+            
             if original_data_size >= used_block_footprint + MIN_SPLIT {
                 // split initial free block into used + free blocks
-                block.size = request_size;
+                block.size   = request_size;
                 block.status = Status::Used;
-                
-                
+                block.class  = Some(class_val);
+                self.class.alloc_count[class_idx] += 1;
+                                
                 // create the new free block due to used block appearance
                 let new_free_addr = original_data_addr + used_block_footprint;
                 let new_free_payload_size = original_data_size - used_block_footprint;
@@ -195,33 +254,44 @@ impl Allocator {
                 let free_block = MemoryBlock {
                     data_address: new_free_addr,
                     size: new_free_payload_size,
-                    status: Status::Free
+                    status: Status::Free,
+                    class: None
                 };
 
                 // add new free block into block registry, next to used block already registered
                 self.blocks.insert(idx + 1, free_block);
             } else {
                 // whole initial free block is gonna be used + it'll contains overflow
+                block.size = class_val;
                 block.status = Status::Used;
+                block.class  = Some(class_val);
+                self.class.alloc_count[class_idx] += 1;
+                self.class.free_count[class_idx] -= 1;
             }
 
-            Ok(original_data_addr)
+            
+            Ok(class_val)
         } else {
             Err("OOM")
         }
     }
 
     // Frees used blocks of memory from data_adress
-    pub fn free(&mut self, received_address: i32) -> Result<&'static str, &'static str> {
+    pub fn free(&mut self, received_class: i32) -> Result<&'static str, &'static str> {
         let mut found = false;
+        
         for block in self.blocks.iter_mut() {
-            if block.status == Status::Used && block.data_address == received_address {
+            if block.status == Status::Used && block.class == Some(received_class) {
                 block.status = Status::Free;
                 found = true;
             }
         }
 
         if found {
+            if let Some(idx) = self.class.sizes.iter().position(|&s| s == received_class) {
+                self.class.free_count[idx]  += 1;
+                self.class.alloc_count[idx] -= 1;
+            }
             Ok("OK")
         } else {
             Err("BAD")
@@ -293,14 +363,39 @@ impl Allocator {
     pub fn count(&self) -> String {
         self.blocks.iter().count().to_string()
     }
+
+    // Prints info related to defined classes
+    pub fn stats(&self) -> Vec<String> {
+        let mut info_classes_stringify: Vec<String> = Vec::new();
+
+        for i in 0..self.class.sizes.len() {
+            let class_size = self.class.sizes[i];
+            let allocators = self.class.alloc_count[i];
+            let frees      = self.class.free_count[i];
+
+            info_classes_stringify.push(format!("{}:alloc={}:free={}", class_size, allocators, frees));
+        }
+        info_classes_stringify
+    }
 }
 
+pub fn lazy_cotroller_init(
+    fit_strat_controller: &mut Option<FitStratController>, 
+    _request_size: i32, 
+    active_strat: FitStrategies) -> &mut FitStratController {
+    // Lazily initialize the controller if no prior INIT instruction was executed
+    fit_strat_controller.get_or_insert_with(|| {
+        let class_instance = Class::new();
+        let allocator = Allocator::init(DEFAULT_HEAP_SIZE, HEADER_SIZE, FOOTER_SIZE, class_instance);
+        FitStratController::new(allocator, active_strat)
+    })
+}
 
-
-const HEADER_SIZE: i32    = 8; // In this memory allocator, the header size is only 8
-const FOOTER_SIZE: i32    = 8;
-const MIN_SPLIT: i32      = 16; // Minimum remaining size of unued block memory that determines split.
-const OVERHEAD: i32       = HEADER_SIZE + FOOTER_SIZE;
+const HEADER_SIZE: i32       = 8; // In this memory allocator, the header size is only 8
+const FOOTER_SIZE: i32       = 8;
+const MIN_SPLIT: i32         = 16; // Minimum remaining size of unued block memory that determines split.
+const OVERHEAD: i32          = HEADER_SIZE + FOOTER_SIZE;
+const DEFAULT_HEAP_SIZE: i32 = 1024;
 
 fn main() {
     let stdin = io::stdin();
@@ -327,12 +422,13 @@ fn main() {
         let strategy: Option<FitStrategies> = expression
             .next()
             .and_then(|s| s.parse().ok());
-        
+        let active_strat = strategy.unwrap_or(FitStrategies::FIRST); 
         match instruction {
             Some(AllowedInstructions::INIT) => {
                 if let Some(size) = number {
-                    let active_strat = strategy.unwrap_or(FitStrategies::FIRST);
-                    let allocator = Allocator::init(size, HEADER_SIZE, FOOTER_SIZE);
+                    
+                    let class_instance = Class::new();
+                    let allocator = Allocator::init(size, HEADER_SIZE, FOOTER_SIZE, class_instance);
                     fit_strat_controller = Some(FitStratController::new(allocator, active_strat));
                     result.push("OK".to_string());
                 } else {
@@ -342,9 +438,10 @@ fn main() {
             }
             Some(AllowedInstructions::ALLOC) => {
                 // Look for an existing freed block that fits
-                if let (Some(ctl), Some(size)) = (&mut fit_strat_controller, number) {
+                if let Some(size) = number {
+                    let ctl = lazy_cotroller_init(&mut fit_strat_controller, size, active_strat);
                     match ctl.alloc(size) {
-                        Ok(addr) => result.push(addr.to_string()),
+                        Ok(class) => result.push(format!("class={}", class)),
                         Err(err) => result.push(err.to_string()),
                     }
                 }
@@ -397,7 +494,8 @@ fn main() {
                 }
             }
             Some(AllowedInstructions::FREE) => {
-                if let (Some(ctl), Some(data_address)) = (&mut fit_strat_controller, number) {
+                if let Some(data_address) = number {
+                    let ctl = lazy_cotroller_init(&mut fit_strat_controller, DEFAULT_HEAP_SIZE, active_strat);
                     match ctl.allocator.free(data_address) {
                         Ok(str) => {
                             result.push(str.to_string());
@@ -437,7 +535,7 @@ fn main() {
                 }
             }
             Some(AllowedInstructions::PREV) => {
-                if let (Some(ctl), Some(addr)) = (&fit_strat_controller, number) {
+                if let (Some(ctl), Some(addr)) = (&mut fit_strat_controller, number) {
                     result.push(ctl.allocator.prev(addr));
                 } else {
                     println!("Inapropiate value for instruction INSERT, expected: num, got: {:?}", number);
@@ -449,6 +547,10 @@ fn main() {
                 if let Some(ctl) = &fit_strat_controller {
                     result.push(ctl.allocator.count());
                 }
+            }
+            Some(AllowedInstructions::STATS) => {
+                let ctl = lazy_cotroller_init(&mut fit_strat_controller, DEFAULT_HEAP_SIZE, active_strat);
+                result.extend(ctl.allocator.stats());
             }
             None => println!("Invalid or missing instruction"),
         }
