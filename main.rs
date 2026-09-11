@@ -246,6 +246,10 @@ impl Allocator {
                 block.status = Status::Used;
                 block.class  = Some(class_val);
                 self.class.alloc_count[class_idx] += 1;
+                // If the class previously had free blocks recorded, decrement by 1
+                if self.class.free_count[class_idx] > 0 {
+                    self.class.free_count[class_idx] -= 1;
+                }
                                 
                 // create the new free block due to used block appearance
                 let new_free_addr = original_data_addr + used_block_footprint;
@@ -266,9 +270,10 @@ impl Allocator {
                 block.status = Status::Used;
                 block.class  = Some(class_val);
                 self.class.alloc_count[class_idx] += 1;
-                self.class.free_count[class_idx] -= 1;
+                if self.class.free_count[class_idx] > 0 {
+                    self.class.free_count[class_idx] -= 1;
+                }
             }
-
             
             Ok(class_val)
         } else {
