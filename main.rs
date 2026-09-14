@@ -1,5 +1,12 @@
+use std::cmp::min;
 use std::io::{self, BufRead};
 use std::str::FromStr;
+use std::collections::HashMap;
+
+pub enum AllocatorEngine { // Lets me keep the logic of incompatible allocator algorithms
+    Knuth(FitStratController),
+    Buddy(BudyAllocator)
+}
 
 #[derive(Debug, PartialEq)]
 pub enum AllowedInstructions {
@@ -13,6 +20,8 @@ pub enum AllowedInstructions {
     COUNT,
     PREV,
     STATS,
+    ORDER,
+    BUDDY,
 }
 
 #[derive(Debug, PartialEq)]
@@ -54,10 +63,17 @@ pub struct Allocator {
     pub class: Class,
 }
 
-// Definition of memory strategy allocator manager - Controls ALLOC depending of the strat
+// Definition of memory strategy allocator manager for Knuth algorithm - Controls ALLOC depending of the strat
 pub struct FitStratController {
     pub allocator: Allocator,
     pub strat: FitStrategies
+}
+
+// Definition of memory buddy allocator manager for Buddy algorithm
+pub struct BudyAllocator {
+    pub max_order: usize,
+    pub free_lists: Vec<Vec<i32>>, // Contains free lists inside other free lists
+    pub allocated: HashMap<i32, usize> // Maps addr & order for allocated memory in blocks
 }
 
 // Mapper that converts input str into enum for match iteration control
@@ -77,6 +93,8 @@ impl FromStr for AllowedInstructions {
             "PREV"     => Ok(AllowedInstructions::PREV),
             "COUNT"    => Ok(AllowedInstructions::COUNT),
             "STATS"    => Ok(AllowedInstructions::STATS),
+            "ORDER"    => Ok(AllowedInstructions::ORDER),
+            "BUDDY"    => Ok(AllowedInstructions::BUDDY),
             _          => Err(ParseInstructionError),
         }
     }
@@ -94,6 +112,104 @@ impl FromStr for FitStrategies {
             _       => Err(ParseInstructionError),
         }
     }
+}
+
+// Buddy allocator functionalities
+impl BudyAllocator {
+    // New instance
+    pub fn new(max_order: usize) -> Self {
+        let mut free_lists = vec![Vec::new(); max_order + 1];
+        free_lists[max_order].push(0); // Initial full heap block at order max_order
+        Self {
+            max_order,
+            free_lists,
+            allocated: HashMap::new(),
+        }
+    }
+
+    // Alloc memory inside blocks
+    pub fn alloc(&mut self, size: usize) -> Result<i32, &'static str> {
+        let req_order =  (size as f64).log2().ceil() as usize;
+        if req_order > self.max_order {
+            return Err("TOO_LARGE")
+        }
+        
+        // Find the smallest order >= req_order with an empty list
+        let mut target_order = None;
+        for order in req_order..=self.max_order {
+            if !self.free_lists[order].is_empty() {
+                target_order = Some(order);
+                break;
+            }
+        }
+
+        let mut current_order = match target_order {
+            Some(o) => o,
+            None           => return Err("OOM")
+        };
+
+        // Pops block from target order
+        let addr = self.free_lists[current_order].pop().unwrap();
+
+        // Split lists repetedly until requested size fits in the best block possible
+        while current_order > req_order {
+            current_order -= 1;
+            let buddy_addr = addr + (1 << current_order);
+            self.free_lists[current_order].push(buddy_addr);
+        }
+
+        self.allocated.insert(addr, req_order);
+        Ok(addr)
+    }
+
+    // Free memory considering coelescing buddy's block
+    pub fn free(&mut self, addr: i32) -> Result<&'static str, &'static str> {
+        let mut order = match self.allocated.remove(&addr) {
+            Some(o) => o,
+            None           => return Err("BAD"),
+        };
+
+        let mut current_addr = addr;
+
+        while order < self.max_order {
+            let buddy_addr = current_addr ^ (1 << order);
+            if let Some(idx) = self.free_lists[order].iter().position(|&a| a == buddy_addr) {
+                self.free_lists[order].remove(idx);
+                current_addr = min(current_addr, buddy_addr);
+                order += 1;
+            } else {
+                break;
+            }
+        }
+
+        self.free_lists[order].push(current_addr);
+        Ok("OK")
+    }
+
+    // Free lists behavior implementation
+    pub fn free_lists(&self, order: usize) -> String {
+        if order > self.max_order {
+            return String::new();
+        }
+
+        let mut list = self.free_lists[order].clone();
+        list.sort();
+        list.iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<String>>()
+            .join(",")
+    }
+
+    pub fn order(&self, size: usize) -> String {
+        let k = (size as f64).log2().ceil() as usize;
+        k.to_string()
+    }
+
+    pub fn buddy(&self, addr: i32, order: usize) -> String {
+        (addr ^ (1 << order)).to_string()
+    }
+
+    
 }
 
 // ALLOC Strategy controller functionalities
@@ -275,7 +391,7 @@ impl Allocator {
                 }
             }
             
-            Ok(class_val)
+            Ok(original_data_addr)
         } else {
             Err("OOM")
         }
@@ -384,6 +500,45 @@ impl Allocator {
     }
 }
 
+impl AllocatorEngine {
+    pub fn alloc(&mut self, size: i32) -> String {
+        match self {
+            AllocatorEngine::Knuth(ctl) => match ctl.alloc(size) {
+                Ok(class)         => format!("class={}", class),
+                Err(err) => err.to_string()
+            },
+            AllocatorEngine::Buddy(ctl) => match ctl.alloc(size as usize)  {
+                Ok(addr) => addr.to_string(),
+                Err(err) => err.to_string()
+            }
+        }
+    }
+
+
+    pub fn free(&mut self, number: i32) -> String {
+        match self {
+            AllocatorEngine::Knuth(ctl) => match ctl.allocator.free(number) {
+                Ok(str_res) => {
+                    ctl.allocator.coalesce();
+                    str_res.to_string()
+                },
+                Err(err) => err.to_string()
+            },
+            AllocatorEngine::Buddy(ctl) => match ctl.free(number) {
+                Ok(str_res) => str_res.to_string(),
+                Err(err) => err.to_string()
+            }
+        }
+    }
+
+    pub fn free_list(&self, order: usize) -> String {
+        match self {
+            AllocatorEngine::Knuth(ctl) => ctl.allocator.print_free_block().join("\n"),
+            AllocatorEngine::Buddy(ctl) => ctl.free_lists(order)
+        }
+    }
+}
+
 pub fn lazy_cotroller_init(
     fit_strat_controller: &mut Option<FitStratController>, 
     _request_size: i32, 
@@ -406,7 +561,7 @@ fn main() {
     let stdin = io::stdin();
     let mut bump = 0; // Initialize dump controller
     let mut result: Vec<String> = Vec::new(); // Initialize result vector that will contain partial solutions
-    let mut fit_strat_controller: Option<FitStratController> = None; // Wrapped in Option to safely manage
+    let mut engine: Option<AllocatorEngine> = None;
     // initialization
     //let mut allocator = Allocator::new(); // Vector that will registry memory blocks
     // in memory
@@ -424,17 +579,19 @@ fn main() {
             None
         }; // Get the Optional number part, i might not get it so thats why i need an option
         
-        let strategy: Option<FitStrategies> = expression
+        /*let strategy: Option<FitStrategies> = expression
             .next()
             .and_then(|s| s.parse().ok());
-        let active_strat = strategy.unwrap_or(FitStrategies::FIRST); 
+        let active_strat = strategy.unwrap_or(FitStrategies::FIRST);*/ // Uncomment when using Knuth alg
         match instruction {
             Some(AllowedInstructions::INIT) => {
                 if let Some(size) = number {
                     
-                    let class_instance = Class::new();
-                    let allocator = Allocator::init(size, HEADER_SIZE, FOOTER_SIZE, class_instance);
-                    fit_strat_controller = Some(FitStratController::new(allocator, active_strat));
+                    //let class_instance = Class::new();
+                    //let allocator = Allocator::init(2.pow(size), HEADER_SIZE, FOOTER_SIZE, class_instance); // Heap size defined by Buddy Allocator
+                    //fit_strat_controller = Some(FitStratController::new(allocator, active_strat));
+                    // Selected Buddy algorithm as Allocator engine for this tests
+                    engine = Some(AllocatorEngine::Buddy(BudyAllocator::new(size as usize)));
                     result.push("OK".to_string());
                 } else {
                     println!("Inapropiate value for instruction INSERT, expected: num, got: {:?}", number);
@@ -443,12 +600,8 @@ fn main() {
             }
             Some(AllowedInstructions::ALLOC) => {
                 // Look for an existing freed block that fits
-                if let Some(size) = number {
-                    let ctl = lazy_cotroller_init(&mut fit_strat_controller, size, active_strat);
-                    match ctl.alloc(size) {
-                        Ok(class) => result.push(format!("class={}", class)),
-                        Err(err) => result.push(err.to_string()),
-                    }
+                if let (Some(eng), Some(size)) = (&mut engine, number) {
+                    result.push(eng.alloc(size));
                 }
                 // Decide whether to reuse or bump
                 // --- WHEN WE DONT TAKE INTO ACCOUNT FREE BLOCKS AS FIRST
@@ -499,15 +652,8 @@ fn main() {
                 }
             }
             Some(AllowedInstructions::FREE) => {
-                if let Some(data_address) = number {
-                    let ctl = lazy_cotroller_init(&mut fit_strat_controller, DEFAULT_HEAP_SIZE, active_strat);
-                    match ctl.allocator.free(data_address) {
-                        Ok(str) => {
-                            result.push(str.to_string());
-                            ctl.allocator.coalesce();
-                        },
-                        Err(err) => result.push(err.to_string()),
-                    }
+                if let (Some(eng), Some(data_address)) = (&mut engine, number) {
+                    result.push(eng.free(data_address));
                 } 
                 // Content from previous tests may help in the future
                 /*if let Some(val) = number {
@@ -530,17 +676,17 @@ fn main() {
                 }*/
             }
             Some(AllowedInstructions::BLOCKS) => {
-                if let Some(ctl) = &fit_strat_controller {
+                if let Some(AllocatorEngine::Knuth(ctl)) = &engine {
                     result.extend(ctl.allocator.print_blocks());
                 }
             }
             Some(AllowedInstructions::FREELIST) => {
-                if let Some(ctl) = &fit_strat_controller {
-                    result.extend(ctl.allocator.print_free_block());
+                if let (Some(eng), Some(order)) = (&engine, number) {
+                    result.push(eng.free_list(order as usize));
                 }
             }
             Some(AllowedInstructions::PREV) => {
-                if let (Some(ctl), Some(addr)) = (&mut fit_strat_controller, number) {
+                if let (Some(AllocatorEngine::Knuth(ctl)), Some(addr)) = (&mut engine, number) {
                     result.push(ctl.allocator.prev(addr));
                 } else {
                     println!("Inapropiate value for instruction INSERT, expected: num, got: {:?}", number);
@@ -549,13 +695,25 @@ fn main() {
 
             }
             Some(AllowedInstructions::COUNT) => {
-                if let Some(ctl) = &fit_strat_controller {
+                if let Some(AllocatorEngine::Knuth(ctl)) = &engine {
                     result.push(ctl.allocator.count());
                 }
             }
             Some(AllowedInstructions::STATS) => {
-                let ctl = lazy_cotroller_init(&mut fit_strat_controller, DEFAULT_HEAP_SIZE, active_strat);
-                result.extend(ctl.allocator.stats());
+                if let Some(AllocatorEngine::Knuth(ctl)) = &engine {
+                    result.extend(ctl.allocator.stats());
+                }
+            }
+            Some(AllowedInstructions::ORDER) => {
+                if let (Some(AllocatorEngine::Buddy(buddy)), Some(order)) = (&engine, number) {
+                    result.push(buddy.order(order as usize));
+                }
+            }
+            Some(AllowedInstructions::BUDDY) => {
+                let order_param: Option<usize> = expression.next().and_then(|o| o.parse().ok());
+                if let (Some(AllocatorEngine::Buddy(buddy)), Some(addr), Some(order)) = (&engine, number, order_param) {
+                    result.push(buddy.buddy(addr, order));
+                }
             }
             None => println!("Invalid or missing instruction"),
         }
