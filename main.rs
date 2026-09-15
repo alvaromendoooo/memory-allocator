@@ -26,6 +26,7 @@ pub enum AllowedInstructions {
     ORDER,
     BUDDY,
     CACHE_CREATE,
+    REPORT,
 }
 
 #[derive(Debug, PartialEq)]
@@ -51,7 +52,8 @@ pub struct MemoryBlock {
     pub data_address: i32,
     pub size: i32,
     pub status: Status,
-    pub class: Option<i32>
+    pub class: Option<i32>,
+    pub req_size: i32,
 }
 
 // Definition of an allocator record to keep track of changes during runtime - SlabAllocator
@@ -83,6 +85,7 @@ pub struct Class {
 pub struct Allocator {
     pub blocks: Vec<MemoryBlock>,
     pub class: Class,
+    pub internal_frag: i32,
 }
 
 // Definition of memory strategy allocator manager for Knuth algorithm - Controls ALLOC depending of the strat
@@ -141,7 +144,8 @@ impl FromStr for AllowedInstructions {
             "ORDER"        => Ok(AllowedInstructions::ORDER),
             "BUDDY"        => Ok(AllowedInstructions::BUDDY),
             "CACHE_CREATE" => Ok(AllowedInstructions::CACHE_CREATE),
-            _          => Err(ParseInstructionError),
+            "REPORT"       => Ok(AllowedInstructions::REPORT),
+            _              => Err(ParseInstructionError),
         }
     }
 }
@@ -468,21 +472,26 @@ impl Allocator {
         Self {
             blocks: Vec::new(),
             class: class_instance,
+            internal_frag: 0,
         }
     }
 
     // Create a new instance of Allocator with free data
-    pub fn init(heap_size: i32, hdr: i32, ftr: i32, class_instance: Class) -> Self {
+    pub fn init(heap_size: i32, class_instance: Class) -> Self {
         let initial_free_block = MemoryBlock {
-            data_address: hdr,
-            size: heap_size - hdr - ftr,
+            //data_address: hdr, - HEADER applied - received from param
+            //size: heap_size - hdr - ftr, - HEADER + FOOTER applied - received from param
+            data_address: 0,
+            size: heap_size,
             status: Status::Free,
-            class: None
+            class: None,
+            req_size: 0,
         };
 
         Self {
             blocks: vec![initial_free_block],
             class: class_instance,
+            internal_frag: 0,
         }
     }
 
@@ -530,20 +539,24 @@ impl Allocator {
             };
             
             let class_val = self.class.sizes[class_idx];
+            let wasted_space = class_val - request_size;
+            self.internal_frag += wasted_space;
             //calculate the total footprint of the newly allocated block (payload + tags) - taking
             //into account that if request_size = 10 and is included in class 16, the size is 16 not 10
-            let used_block_footprint = class_val + OVERHEAD;
+            //let used_block_footprint = class_val + OVERHEAD; - KNUTH original
 
 
             let block = &mut self.blocks[idx]; // It's gonna be updated
             let original_data_addr = block.data_address;
             let original_data_size = block.size;
+            //let original_data_size = class_val;
             
-            if original_data_size >= used_block_footprint + MIN_SPLIT {
+            if original_data_size >= class_val + MIN_SPLIT {
                 // split initial free block into used + free blocks
-                block.size   = request_size;
-                block.status = Status::Used;
-                block.class  = Some(class_val);
+                block.size     = class_val;
+                block.status   = Status::Used;
+                block.class    = Some(class_val);
+                block.req_size = request_size;
                 self.class.alloc_count[class_idx] += 1;
                 // If the class previously had free blocks recorded, decrement by 1
                 if self.class.free_count[class_idx] > 0 {
@@ -551,23 +564,27 @@ impl Allocator {
                 }
                                 
                 // create the new free block due to used block appearance
-                let new_free_addr = original_data_addr + used_block_footprint;
-                let new_free_payload_size = original_data_size - used_block_footprint;
+                let new_free_addr = original_data_addr + class_val; // KNUTH original goes
+                // used_block_footprint
+                let new_free_payload_size = original_data_size - class_val; // KNUTH original goes
+                // used_block_footprint
 
                 let free_block = MemoryBlock {
                     data_address: new_free_addr,
                     size: new_free_payload_size,
                     status: Status::Free,
-                    class: None
+                    class: None,
+                    req_size: 0,
                 };
 
                 // add new free block into block registry, next to used block already registered
                 self.blocks.insert(idx + 1, free_block);
             } else {
                 // whole initial free block is gonna be used + it'll contains overflow
-                block.size = class_val;
-                block.status = Status::Used;
-                block.class  = Some(class_val);
+                block.size     = class_val;
+                block.status   = Status::Used;
+                block.class    = Some(class_val);
+                block.req_size = request_size;
                 self.class.alloc_count[class_idx] += 1;
                 if self.class.free_count[class_idx] > 0 {
                     self.class.free_count[class_idx] -= 1;
@@ -585,9 +602,16 @@ impl Allocator {
         let mut found = false;
         
         for block in self.blocks.iter_mut() {
-            if block.status == Status::Used && block.class == Some(received_class) {
+            if block.status == Status::Used && block.data_address == received_class {
                 block.status = Status::Free;
                 found = true;
+                // If removed alloc block, substract internal frag from that block
+                if let Some(c) = block.class {
+                    if self.internal_frag > 0 {
+                        self.internal_frag -= c - block.req_size;
+                    }
+                }
+                break;
             }
         }
 
@@ -681,6 +705,37 @@ impl Allocator {
         }
         info_classes_stringify
     }
+
+    pub fn report(&self) -> String {
+        let mut total_used = 0;
+        let mut total_free = 0;
+        let mut free_blocks_count = 0;
+        let mut largest_free = 0;
+
+        for block in &self.blocks {
+            match block.status {
+                Status::Free => {
+                    total_free += block.size;
+                    free_blocks_count += 1;
+                    if block.size > largest_free {
+                        largest_free = block.size;
+                    }
+                }
+                Status::Used => {
+                    total_used += block.size;
+                }
+            }
+        }
+
+        let external_frag = if total_free > 0 {
+            1.0 - (largest_free as f64 / total_free as f64)
+        } else {
+            0.0
+        };
+
+        format!("used={} free={} free_blocks={} largest_free={} internal_frag={} external_frag={:.4}",
+            total_used, total_free, free_blocks_count, largest_free, self.internal_frag, external_frag)
+    }
 }
 
 impl ThreadCacheManager {
@@ -741,7 +796,9 @@ impl AllocatorEngine {
             AllocatorEngine::Knuth(ctl) => {
                 if let Some(size) = size {
                     match ctl.alloc(size) {
-                        Ok(class)         => format!("class={}", class),
+                        //Ok(class)         => format!("class={}", class), - Pure knuth with class
+                        //visualization
+                        Ok(addr)          => addr.to_string(),
                         Err(err) => err.to_string()
                     }
                 } else {
@@ -872,7 +929,7 @@ pub fn lazy_cotroller_init(
     // Lazily initialize the controller if no prior INIT instruction was executed
     fit_strat_controller.get_or_insert_with(|| {
         let class_instance = Class::new();
-        let allocator = Allocator::init(DEFAULT_HEAP_SIZE, HEADER_SIZE, FOOTER_SIZE, class_instance);
+        let allocator = Allocator::init(DEFAULT_HEAP_SIZE, class_instance);
         FitStratController::new(allocator, active_strat)
     })
 }
@@ -880,7 +937,7 @@ pub fn lazy_cotroller_init(
 const HEADER_SIZE: i32       = 8; // In this memory allocator, the header size is only 8
 const FOOTER_SIZE: i32       = 8;
 const MIN_SPLIT: i32         = 16; // Minimum remaining size of unued block memory that determines split.
-const OVERHEAD: i32          = HEADER_SIZE + FOOTER_SIZE;
+const OVERHEAD: i32          = 0; // HEADER_SIZE + FOOTER_SIZE if head + foot implemented
 const DEFAULT_HEAP_SIZE: i32 = 1024;
 const CACHE_MAX: usize       = 5;
 const BATCH: usize           = 4;
@@ -916,11 +973,11 @@ fn main() {
 
                 if let Some(size) = number {
                     
-                    //let class_instance = Class::new();
-                    //let allocator = Allocator::init(2.pow(size), HEADER_SIZE, FOOTER_SIZE, class_instance); // Heap size defined by Buddy Allocator
-                    //fit_strat_controller = Some(FitStratController::new(allocator, active_strat));
+                    let class_instance = Class::new();
+                    let allocator = Allocator::init(size, class_instance);
+                    engine = Some(AllocatorEngine::Knuth(FitStratController::new(allocator, FitStrategies::FIRST)));
                     // Selected Buddy algorithm as Allocator engine for this tests
-                    engine = Some(AllocatorEngine::Buddy(BudyAllocator::new(size as usize)));
+                    //engine = Some(AllocatorEngine::Buddy(BudyAllocator::new(size as usize)));
                     result.push("OK".to_string());
                 } else {
                     println!("Inapropiate value for instruction INSERT, expected: num, got: {:?}", number);
@@ -928,7 +985,12 @@ fn main() {
                 }
             }
             Some(AllowedInstructions::ALLOC) => {
-                // Look for an existing freed block that fits -- BUDDY
+                // Knuth
+                let size: Option<i32> = expression.next().and_then(|s| s.trim().parse().ok());
+                if let Some(eng) = &mut engine {
+                    result.push(eng.alloc(size, None, None, None));
+                }
+                // BUDDY
                 /*let number: Option<i32> = if let Some(s) = expression.next() {
                     s.trim().parse::<i32>().ok()
                 } else {
@@ -944,14 +1006,14 @@ fn main() {
                     result.push(eng.alloc(None, cache_name, None, None));
                 }*/
                 // THREAD-CACHE
-                let tid: Option<i32>   = expression.next().and_then(|t| t.parse().ok());
+                /*let tid: Option<i32>   = expression.next().and_then(|t| t.parse().ok());
                 let class: Option<i32> = expression.next().and_then(|c| c.parse().ok());
                 // Lazy init the engine
                 let eng = engine.get_or_insert_with(|| {
                     AllocatorEngine::ThreadLocalCache(ThreadCacheManager::new())
                 });
 
-                result.push(eng.alloc(None, None, tid, class));
+                result.push(eng.alloc(None, None, tid, class));*/
                 // Decide whether to reuse or bump
                 // --- WHEN WE DONT TAKE INTO ACCOUNT FREE BLOCKS AS FIRST
                 /*if let Some(addr) = reused_block_addr {
@@ -1013,6 +1075,11 @@ fn main() {
                 }
             }
             Some(AllowedInstructions::FREE) => {
+                // Knuth
+                let addr: Option<i32> = expression.next().and_then(|s| s.trim().parse().ok());
+                if let Some(eng) = &mut engine {
+                    result.push(eng.free(addr, None, None, None, None, None));
+                }
                 // BUDYY
                 /*let number: Option<i32> = if let Some(s) = expression.next() {
                     s.trim().parse::<i32>().ok()
@@ -1031,12 +1098,12 @@ fn main() {
                     result.push(eng.free(None, cache_name, sid, slot, None, None))
                 }*/
                 // THREAD-CACHE
-                let tid: Option<i32> = expression.next().and_then(|t| t.parse().ok());
+                /*let tid: Option<i32> = expression.next().and_then(|t| t.parse().ok());
                 let class: Option<i32> = expression.next().and_then(|c| c.parse().ok());
                 let eng = engine.get_or_insert_with(|| {
                     AllocatorEngine::ThreadLocalCache(ThreadCacheManager::new())
                 });
-                result.push(eng.free(None, None, None, None, tid, class));
+                result.push(eng.free(None, None, None, None, tid, class));*/
                 
                 // Content from previous tests may help in the future
                 /*if let Some(val) = number {
@@ -1163,6 +1230,11 @@ fn main() {
                 } else {
                     println!("Invalid arguments for CACHE_CREATE instruction");
                     return;
+                }
+            }
+            Some(AllowedInstructions::REPORT) => {
+                if let Some(AllocatorEngine::Knuth(ctl)) = &engine {
+                    result.push(ctl.allocator.report());
                 }
             }
             None => println!("Invalid or missing instruction"),
