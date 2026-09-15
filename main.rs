@@ -528,7 +528,7 @@ impl Allocator {
     pub fn alloc_by_idx(&mut self, request_size: i32, block_idx: Option<usize>) -> Result<i32, &'static str> {
         // Base case, more allocated size that default owned
         if request_size > DEFAULT_HEAP_SIZE {
-            return Err("TOO_LARGE")
+            return Err("OOM")
         }
 
         if let Some(idx) = block_idx {
