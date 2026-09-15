@@ -998,8 +998,8 @@ fn main() {
                 }*/
                 // SLAB
                 let cache_name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());
-                if let (Some(eng), Some(cache_name)) = (&engine, cache_name) {
-                    result.push(eng.stats(cache_name))
+                if let (Some(eng), Some(cache_name)) = (&engine, cache_name.as_ref()) {
+                    result.push(eng.stats(cache_name.clone()))
                 }
             }
             Some(AllowedInstructions::ORDER) => {
