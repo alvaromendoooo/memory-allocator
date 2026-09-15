@@ -535,7 +535,7 @@ impl Allocator {
             // Resolve class size
             let class_idx = match self.get_class_index(request_size) {
                 Some(c) => c,
-                None    => return Err("TOO_LARGE"),
+                None    => return Err("OOM"),
             };
             
             let class_val = self.class.sizes[class_idx];
