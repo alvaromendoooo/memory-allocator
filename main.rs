@@ -1,11 +1,13 @@
 use std::cmp::min;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, empty};
 use std::str::FromStr;
 use std::collections::HashMap;
 
+#[derive(Debug)]
 pub enum AllocatorEngine { // Lets me keep the logic of incompatible allocator algorithms
     Knuth(FitStratController),
-    Buddy(BudyAllocator)
+    Buddy(BudyAllocator),
+    Slab(HashMap<String, SlabAllocator>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -22,6 +24,7 @@ pub enum AllowedInstructions {
     STATS,
     ORDER,
     BUDDY,
+    CACHE_CREATE,
 }
 
 #[derive(Debug, PartialEq)]
@@ -50,7 +53,24 @@ pub struct MemoryBlock {
     pub class: Option<i32>
 }
 
+// Definition of an allocator record to keep track of changes during runtime - SlabAllocator
+#[derive(Debug, Clone)]
+pub struct AllocRecord {
+    pub name: String,
+    pub slab: usize,
+    pub slot: usize
+}
+
+// Single slab containing fixed size slots
+#[derive(Debug)]
+pub struct Slab {
+    //pub slot_size: usize, - Not needed now
+    pub total_slots: usize,
+    pub free_slots: Vec<bool>,
+}
+
 // Defiition of Classes for allocating memory
+#[derive(Debug)]
 pub struct Class {
     pub sizes: Vec<i32>,
     pub alloc_count: Vec<i32>,
@@ -58,22 +78,36 @@ pub struct Class {
 }
 
 // Definition of allocator instance, contolling memory block registry
+#[derive(Debug)]
 pub struct Allocator {
     pub blocks: Vec<MemoryBlock>,
     pub class: Class,
 }
 
 // Definition of memory strategy allocator manager for Knuth algorithm - Controls ALLOC depending of the strat
+#[derive(Debug)]
 pub struct FitStratController {
     pub allocator: Allocator,
     pub strat: FitStrategies
 }
 
 // Definition of memory buddy allocator manager for Buddy algorithm
+#[derive(Debug)]
 pub struct BudyAllocator {
     pub max_order: usize,
     pub free_lists: Vec<Vec<i32>>, // Contains free lists inside other free lists
     pub allocated: HashMap<i32, usize> // Maps addr & order for allocated memory in blocks
+}
+
+// Definition of memory slab allocator manager for Slab algorithm
+#[derive(Debug)]
+pub struct SlabAllocator {
+    pub name: String,
+    pub obj_size: usize,
+    pub slab_obj_count: usize,
+    pub slabs: Vec<Slab>,
+    pub records: HashMap<String, AllocRecord>,
+    pub allocator_count: i32,
 }
 
 // Mapper that converts input str into enum for match iteration control
@@ -84,17 +118,18 @@ impl FromStr for AllowedInstructions {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_uppercase().as_str() {
             "INIT" => Ok(AllowedInstructions::INIT),
-            "ALLOC"    => Ok(AllowedInstructions::ALLOC),
-            "USED"     => Ok(AllowedInstructions::USED),
-            "RESET"    => Ok(AllowedInstructions::RESET),
-            "FREE"     => Ok(AllowedInstructions::FREE),
-            "BLOCKS"   => Ok(AllowedInstructions::BLOCKS),
-            "FREELIST" => Ok(AllowedInstructions::FREELIST),
-            "PREV"     => Ok(AllowedInstructions::PREV),
-            "COUNT"    => Ok(AllowedInstructions::COUNT),
-            "STATS"    => Ok(AllowedInstructions::STATS),
-            "ORDER"    => Ok(AllowedInstructions::ORDER),
-            "BUDDY"    => Ok(AllowedInstructions::BUDDY),
+            "ALLOC"        => Ok(AllowedInstructions::ALLOC),
+            "USED"         => Ok(AllowedInstructions::USED),
+            "RESET"        => Ok(AllowedInstructions::RESET),
+            "FREE"         => Ok(AllowedInstructions::FREE),
+            "BLOCKS"       => Ok(AllowedInstructions::BLOCKS),
+            "FREELIST"     => Ok(AllowedInstructions::FREELIST),
+            "PREV"         => Ok(AllowedInstructions::PREV),
+            "COUNT"        => Ok(AllowedInstructions::COUNT),
+            "STATS"        => Ok(AllowedInstructions::STATS),
+            "ORDER"        => Ok(AllowedInstructions::ORDER),
+            "BUDDY"        => Ok(AllowedInstructions::BUDDY),
+            "CACHE_CREATE" => Ok(AllowedInstructions::CACHE_CREATE),
             _          => Err(ParseInstructionError),
         }
     }
@@ -111,6 +146,143 @@ impl FromStr for FitStrategies {
             "WORST" => Ok(FitStrategies::WORST),
             _       => Err(ParseInstructionError),
         }
+    }
+}
+
+// Functionalities for a slab
+impl Slab {
+    // New instance
+    pub fn new(total_slots: usize) -> Self {
+        Self {
+            total_slots,
+            free_slots: vec![true; total_slots] // All slots are free in first place
+        }
+    }
+
+    // Finds first available slot in a slab
+    pub fn alloc_slot(&mut self) -> Option<usize> {
+        if let Some(slot_idx) = self.free_slots.iter().position(|&s| s) {
+            self.free_slots[slot_idx] = false; // Now it will be filled
+            Some(slot_idx)
+        } else {
+            None // Slab is full
+        }
+    }
+
+    // Frees a specific slot from a slab
+    pub fn free_slot(&mut self, slot_idx: usize) -> bool {
+        if slot_idx < self.total_slots && !self.free_slots[slot_idx] {
+            self.free_slots[slot_idx] = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// Slab allocator functionalities
+impl SlabAllocator {
+    // New instance
+    pub fn new(name: String, obj_size: usize, slab_obj_count: usize) -> Self {
+        Self {
+            name,
+            obj_size,
+            slab_obj_count,
+            slabs: Vec::new(),
+            records: HashMap::new(),
+            allocator_count: 0
+        }
+    }
+    
+    // Alloc a contiguous run of memory pre-divided into fixed size objects of slots
+    pub fn alloc(&mut self, name: String) -> Result<String, &'static str> {
+       // Find a slot in a existing slab
+        for (slab_idx, slab) in self.slabs.iter_mut().enumerate() {
+            if let Some(slot_idx) = slab.alloc_slot() {
+                let record = AllocRecord {
+                    name: name.clone(),
+                    slab: slab_idx,
+                    slot: slot_idx
+                };
+
+                let record_str = format!("{}:{}", record.slab, record.slot);
+                self.records.insert(format!("{}@{}", name, record_str), record);
+                self.allocator_count += 1;
+                return Ok(record_str)
+            }
+        }
+
+        // If all slots are full, we need to create a new slab
+        let mut new_slab = Slab::new(self.slab_obj_count);
+        let slot_idx = new_slab.alloc_slot().unwrap();
+        let slab_idx = self.slabs.len();
+        self.slabs.push(new_slab);
+
+        let record = AllocRecord {
+            name: name.clone(),
+            slab: slab_idx,
+            slot: slot_idx
+        };
+
+        let record_str = format!("{}:{}", record.slab, record.slot);
+        self.records.insert(format!("{}@{}", name, record_str), record);
+        self.allocator_count += 1;
+        Ok(record_str)
+
+    }
+
+    pub fn free(&mut self, name: String, slab: usize, slot: usize) -> String {
+
+        if let Some(slab_related) = self.slabs.get_mut(slab) {
+            if slab_related.free_slot(slot) {
+                let deleted_key = format!("{}@{}:{}", name, slab, slot);
+                if self.records.remove(&deleted_key).is_some() {
+                    self.allocator_count -= 1;
+                    "OK".to_string()
+                } else {
+                    "BAD".to_string()
+                }
+            } else {
+                "BAD".to_string()
+            }
+            
+        } else {
+            "BAD".to_string()
+        }
+    }
+
+    // Shows info about cache object created
+    pub fn stats(&self, name: String) -> String {
+        // Count how many records belong to this name
+        let objs_alloc = self.records.values()
+            .filter(|r| r.name == name)
+            .count();
+
+        let mut empty = 0;
+        let mut full = 0;
+        let mut partial = 0;
+
+        for s in &self.slabs {
+            let has_free = s.free_slots.iter().any(|&slot| slot);
+            let has_used = s.free_slots.iter().any(|&slot| !slot);
+
+            if has_free && !has_used {
+                empty += 1;
+            } else if has_used && !has_free {
+                full += 1;
+            } else if has_free && has_used {
+                partial += 1;
+            }
+        }
+
+        format!(
+            "objs_alloc={} slabs={} empty={} partial={} full={}",
+            objs_alloc,
+            self.slabs.len(),
+            empty,
+            partial,
+            full
+        )
     }
 }
 
@@ -501,32 +673,82 @@ impl Allocator {
 }
 
 impl AllocatorEngine {
-    pub fn alloc(&mut self, size: i32) -> String {
+    pub fn alloc(&mut self, size: Option<i32>, name: Option<String>) -> String {
         match self {
-            AllocatorEngine::Knuth(ctl) => match ctl.alloc(size) {
-                Ok(class)         => format!("class={}", class),
-                Err(err) => err.to_string()
+            AllocatorEngine::Knuth(ctl) => {
+                if let Some(size) = size {
+                    match ctl.alloc(size) {
+                        Ok(class)         => format!("class={}", class),
+                        Err(err) => err.to_string()
+                    }
+                } else {
+                    "MISSING_SIZE_PARAM".to_string()
+                }
             },
-            AllocatorEngine::Buddy(ctl) => match ctl.alloc(size as usize)  {
-                Ok(addr) => addr.to_string(),
-                Err(err) => err.to_string()
+            AllocatorEngine::Buddy(ctl) => {
+                if let Some(size) = size {
+                    match ctl.alloc(size as usize)  {
+                        Ok(addr) => addr.to_string(),
+                        Err(err) => err.to_string()
+                    }
+                } else {
+                    "MISSING_SIZE_PARAM".to_string()
+                }
+            },   
+            AllocatorEngine::Slab(caches) => {
+                if let Some(cache_name) = name {
+                    if let Some(allocator) = caches.get_mut(&cache_name) {
+                        match allocator.alloc(cache_name) {
+                            Ok(slab_slot) => slab_slot,
+                            Err(err) => err.to_string(),
+
+                        }
+                    } else {
+                        "BAD".to_string()
+                    }
+                } else {
+                    "MISSING_NAME_PARAM".to_string()
+                }
             }
         }
     }
 
 
-    pub fn free(&mut self, number: i32) -> String {
+    pub fn free(&mut self, number: Option<i32>, name: Option<String>, slab: Option<usize>, slot: Option<usize>) -> String {
         match self {
-            AllocatorEngine::Knuth(ctl) => match ctl.allocator.free(number) {
-                Ok(str_res) => {
-                    ctl.allocator.coalesce();
-                    str_res.to_string()
-                },
-                Err(err) => err.to_string()
+            AllocatorEngine::Knuth(ctl) => {
+                if let Some(number) = number {
+                    match ctl.allocator.free(number) {
+                        Ok(str_res) => {
+                            ctl.allocator.coalesce();
+                            str_res.to_string()
+                        },
+                        Err(err) => err.to_string()
+                    }
+                } else {
+                    "MISSING_NUMBER_PARAM".to_string()
+                }
             },
-            AllocatorEngine::Buddy(ctl) => match ctl.free(number) {
-                Ok(str_res) => str_res.to_string(),
-                Err(err) => err.to_string()
+            AllocatorEngine::Buddy(ctl) => {
+                if let Some(number) = number {
+                    match ctl.free(number) {
+                        Ok(str_res) => str_res.to_string(),
+                        Err(err) => err.to_string()
+                    }
+                } else {
+                    "MISSING_NUMBER_PARAM".to_string()
+                }
+            },
+            AllocatorEngine::Slab(caches) => {
+                if let (Some(name), Some(slab), Some(slot)) = (name, slab, slot) {
+                    if let Some(allocator) = caches.get_mut(&name) {
+                        allocator.free(name, slab, slot)
+                    } else {
+                        "BAD".to_string()
+                    }
+                } else {
+                    "MISSING_REQUIRED_PARAMS".to_string()
+                }
             }
         }
     }
@@ -534,7 +756,22 @@ impl AllocatorEngine {
     pub fn free_list(&self, order: usize) -> String {
         match self {
             AllocatorEngine::Knuth(ctl) => ctl.allocator.print_free_block().join("\n"),
-            AllocatorEngine::Buddy(ctl) => ctl.free_lists(order)
+            AllocatorEngine::Buddy(ctl) => ctl.free_lists(order),
+            AllocatorEngine::Slab(_) => "NOT_SUPPORTED".to_string(),
+        }
+    }
+
+    pub fn stats(&self, name: String) -> String {
+        match self {
+            AllocatorEngine::Knuth(ctl) => ctl.allocator.stats().join("\n"),
+            AllocatorEngine::Buddy(_) => "NOT_SUPPORTED".to_string(),
+            AllocatorEngine::Slab(caches) => {
+                if let Some(allocator) = caches.get(&name) {
+                    allocator.stats(name)
+                } else {
+                    "BAD".to_string()
+                }
+            }
         }
     }
 }
@@ -572,19 +809,19 @@ fn main() {
         // separated into whitespaces
         let instruction: Option<AllowedInstructions> = expression
             .next()
-            .and_then(|s| s.parse().ok());// Get the instruction part parsed as valid enum
-        let number: Option<i32> = if let Some(s) = expression.next() {
-            s.trim().parse::<i32>().ok()
-        } else {
-            None
-        }; // Get the Optional number part, i might not get it so thats why i need an option
-        
+            .and_then(|s| s.parse().ok());// Get the instruction part parsed as valid enum        
         /*let strategy: Option<FitStrategies> = expression
             .next()
             .and_then(|s| s.parse().ok());
         let active_strat = strategy.unwrap_or(FitStrategies::FIRST);*/ // Uncomment when using Knuth alg
         match instruction {
             Some(AllowedInstructions::INIT) => {
+                let number: Option<i32> = if let Some(s) = expression.next() {
+                    s.trim().parse::<i32>().ok()
+                } else {
+                    None
+                }; // Get the Optional number part, i might not get it so thats why i need an option
+
                 if let Some(size) = number {
                     
                     //let class_instance = Class::new();
@@ -599,9 +836,20 @@ fn main() {
                 }
             }
             Some(AllowedInstructions::ALLOC) => {
-                // Look for an existing freed block that fits
-                if let (Some(eng), Some(size)) = (&mut engine, number) {
-                    result.push(eng.alloc(size));
+                // Look for an existing freed block that fits -- BUDDY
+                /*let number: Option<i32> = if let Some(s) = expression.next() {
+                    s.trim().parse::<i32>().ok()
+                } else {
+                    None
+                }; // Get the Optional number part, i might not get it so thats why i need an option
+
+                if let Some(eng) = &mut engine {
+                    result.push(eng.alloc(number, None));
+                }*/
+                // -- SLAB
+                let cache_name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());
+                if let Some(eng) = &mut engine {
+                    result.push(eng.alloc(None, cache_name));
                 }
                 // Decide whether to reuse or bump
                 // --- WHEN WE DONT TAKE INTO ACCOUNT FREE BLOCKS AS FIRST
@@ -630,11 +878,17 @@ fn main() {
                     }
                 }
                 }*/ else {
-                    println!("Inappropriate value for instruction ALLOC, expected: num, got: {:?}", number);
+                    println!("Inappropriate value for instruction ALLOC");
                     return;
                 }
             }
             Some(AllowedInstructions::USED) => {
+                let number: Option<i32> = if let Some(s) = expression.next() {
+                    s.trim().parse::<i32>().ok()
+                } else {
+                    None
+                }; // Get the Optional number part, i might not get it so thats why i need an option
+
                 if number.is_some() {
                     println!("Unexpected value for instruction USED: got: {:?}", number);
                     return;
@@ -643,6 +897,12 @@ fn main() {
                 }
             }
             Some(AllowedInstructions::RESET) => {
+                let number: Option<i32> = if let Some(s) = expression.next() {
+                    s.trim().parse::<i32>().ok()
+                } else {
+                    None
+                }; // Get the Optional number part, i might not get it so thats why i need an option
+
                 if number.is_some() {
                     println!("Unexpected value for instruction RESET: got: {:?}", number);
                     return;
@@ -652,9 +912,23 @@ fn main() {
                 }
             }
             Some(AllowedInstructions::FREE) => {
-                if let (Some(eng), Some(data_address)) = (&mut engine, number) {
-                    result.push(eng.free(data_address));
-                } 
+                // BUDYY
+                /*let number: Option<i32> = if let Some(s) = expression.next() {
+                    s.trim().parse::<i32>().ok()
+                } else {
+                    None
+                }; // Get the Optional number part, i might not get it so thats why i need an option
+
+                if let Some(eng) = &mut engine {
+                    result.push(eng.free(number, None, None, None));
+                }*/
+                // SLAB
+                let cache_name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());
+                let sid: Option<usize> = expression.next().and_then(|n| n.parse().ok());
+                let slot: Option<usize> = expression.next().and_then(|n| n.parse().ok());
+                if let Some(eng) = &mut engine {
+                    result.push(eng.free(None, cache_name, sid, slot))
+                }
                 // Content from previous tests may help in the future
                 /*if let Some(val) = number {
                     let mut found: bool = false;
@@ -681,11 +955,23 @@ fn main() {
                 }
             }
             Some(AllowedInstructions::FREELIST) => {
+                let number: Option<i32> = if let Some(s) = expression.next() {
+                    s.trim().parse::<i32>().ok()
+                } else {
+                    None
+                }; // Get the Optional number part, i might not get it so thats why i need an option
+
                 if let (Some(eng), Some(order)) = (&engine, number) {
                     result.push(eng.free_list(order as usize));
                 }
             }
             Some(AllowedInstructions::PREV) => {
+                let number: Option<i32> = if let Some(s) = expression.next() {
+                    s.trim().parse::<i32>().ok()
+                } else {
+                    None
+                }; // Get the Optional number part, i might not get it so thats why i need an option
+
                 if let (Some(AllocatorEngine::Knuth(ctl)), Some(addr)) = (&mut engine, number) {
                     result.push(ctl.allocator.prev(addr));
                 } else {
@@ -700,19 +986,69 @@ fn main() {
                 }
             }
             Some(AllowedInstructions::STATS) => {
+                // KNUTH
+                /*let number: Option<i32> = if let Some(s) = expression.next() {
+                    s.trim().parse::<i32>().ok()
+                } else {
+                    None
+                }; // Get the Optional number part, i might not get it so thats why i need an option
+
                 if let Some(AllocatorEngine::Knuth(ctl)) = &engine {
-                    result.extend(ctl.allocator.stats());
+                    result.push(ctl.allocator.stats());
+                }*/
+                // SLAB
+                let cache_name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());
+                if let (Some(eng), Some(cache_name)) = (&engine, cache_name) {
+                    result.push(eng.stats(cache_name))
                 }
             }
             Some(AllowedInstructions::ORDER) => {
+                let number: Option<i32> = if let Some(s) = expression.next() {
+                    s.trim().parse::<i32>().ok()
+                } else {
+                    None
+                }; // Get the Optional number part, i might not get it so thats why i need an option
+
                 if let (Some(AllocatorEngine::Buddy(buddy)), Some(order)) = (&engine, number) {
                     result.push(buddy.order(order as usize));
                 }
             }
             Some(AllowedInstructions::BUDDY) => {
+                let number: Option<i32> = if let Some(s) = expression.next() {
+                    s.trim().parse::<i32>().ok()
+                } else {
+                    None
+                }; // Get the Optional number part, i might not get it so thats why i need an option
+
                 let order_param: Option<usize> = expression.next().and_then(|o| o.parse().ok());
                 if let (Some(AllocatorEngine::Buddy(buddy)), Some(addr), Some(order)) = (&engine, number, order_param) {
                     result.push(buddy.buddy(addr, order));
+                }
+            }
+            Some(AllowedInstructions::CACHE_CREATE) => {
+                let name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());            
+                let obj_size: Option<usize> = expression.next().and_then(|s| s.parse().ok());
+                let slab_obj_count: Option<usize> = expression.next().and_then(|s| s.parse().ok());
+
+                if let (Some(cache_name), Some(object_size), Some(slab_object_count)) = (name, obj_size, slab_obj_count) {
+                    let caches = match &mut engine {
+                        Some(AllocatorEngine::Slab(map)) => map,
+                        _ => {
+                            engine = Some(AllocatorEngine::Slab(HashMap::new()));
+                            if let Some(AllocatorEngine::Slab(map)) = &mut engine {
+                                map
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                    };
+
+                    let new_allocator = SlabAllocator::new(cache_name.clone(), object_size, slab_object_count);
+                    caches.insert(cache_name, new_allocator);
+                    result.push("OK".to_string())
+                } else {
+                    println!("Invalid arguments for CACHE_CREATE instruction");
+                    return;
                 }
             }
             None => println!("Invalid or missing instruction"),
