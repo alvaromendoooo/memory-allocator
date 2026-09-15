@@ -1,13 +1,14 @@
 use std::cmp::min;
-use std::io::{self, BufRead, empty};
+use std::io::{self, BufRead};
 use std::str::FromStr;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 
 #[derive(Debug)]
 pub enum AllocatorEngine { // Lets me keep the logic of incompatible allocator algorithms
     Knuth(FitStratController),
     Buddy(BudyAllocator),
     Slab(HashMap<String, SlabAllocator>),
+    ThreadLocalCache(ThreadCacheManager),
 }
 
 #[derive(Debug, PartialEq)]
@@ -108,6 +109,16 @@ pub struct SlabAllocator {
     pub slabs: Vec<Slab>,
     pub records: HashMap<String, AllocRecord>,
     pub allocator_count: i32,
+}
+
+// Definition of Thread cache manager
+#[derive(Debug, Default)]
+pub struct ThreadCacheManager {
+    // Stores how many blocks are availabe per class in central pool
+    pub central: HashMap<i32, usize>,
+
+    // Per thread, per class -> blocks count: tid -> (class -> block_count)
+    pub threads: HashMap<i32, BTreeMap<i32, usize>>,
 }
 
 // Mapper that converts input str into enum for match iteration control
@@ -672,8 +683,60 @@ impl Allocator {
     }
 }
 
+impl ThreadCacheManager {
+    // New instance
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn alloc(&mut self, thread_id: i32, class: i32) -> String {
+        let thread = self.threads.entry(thread_id).or_default();
+        let local_count = thread.entry(class).or_insert(0); // Default
+        // value as 0 if there is no local block count
+        if *local_count > 0 {
+            *local_count -= 1;
+            "local".to_string()
+        } else { // thread local cache for class is empty
+            // Cache MISS: Batch 4 blocks from central cache
+            *local_count = BATCH - 1;
+            *self.central.entry(class).or_insert(0) += BATCH;
+            "central".to_string()
+        }
+    }
+
+    pub fn free(&mut self, thread_id: i32, class: i32) -> String {
+        let thread = self.threads.entry(thread_id).or_default();
+        let local_count = thread.entry(class).or_insert(0);
+        let central_available = self.central.entry(class).or_insert(0);
+
+        if *local_count < CACHE_MAX {
+            *local_count += 1;
+            if *central_available > 0 {
+                *central_available -= 1;
+            }
+            "local".to_string()
+        } else {
+            *local_count -= HALF;
+            *central_available += HALF;
+            "flush".to_string()
+        }
+    }
+
+    pub fn stats(&self, class: i32) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(cache) = self.threads.get(&class) {
+            for (&class, &count) in cache {
+                if count > 0 {
+                    out.push(format!("class={}:{}", class, count));
+                }
+            }
+        }
+        out
+    }
+}
+
 impl AllocatorEngine {
-    pub fn alloc(&mut self, size: Option<i32>, name: Option<String>) -> String {
+    pub fn alloc(&mut self, size: Option<i32>, name: Option<String>, thread_id: Option<i32>, class: Option<i32>) -> String {
         match self {
             AllocatorEngine::Knuth(ctl) => {
                 if let Some(size) = size {
@@ -709,12 +772,19 @@ impl AllocatorEngine {
                 } else {
                     "MISSING_NAME_PARAM".to_string()
                 }
+            },
+            AllocatorEngine::ThreadLocalCache(ctl) => {
+                if let (Some(thread_id), Some(class)) = (thread_id, class) {
+                    ctl.alloc(thread_id, class)
+                } else {
+                    "BAD".to_string()
+                }
             }
         }
     }
 
 
-    pub fn free(&mut self, number: Option<i32>, name: Option<String>, slab: Option<usize>, slot: Option<usize>) -> String {
+    pub fn free(&mut self, number: Option<i32>, name: Option<String>, slab: Option<usize>, slot: Option<usize>, thread_id: Option<i32>, class: Option<i32>) -> String {
         match self {
             AllocatorEngine::Knuth(ctl) => {
                 if let Some(number) = number {
@@ -749,6 +819,13 @@ impl AllocatorEngine {
                 } else {
                     "MISSING_REQUIRED_PARAMS".to_string()
                 }
+            },
+            AllocatorEngine::ThreadLocalCache(ctl) => {
+                if let (Some(thread_id), Some(class)) = (thread_id, class) {
+                    ctl.free(thread_id, class)
+                } else {
+                    "BAD".to_string()
+                }
             }
         }
     }
@@ -758,18 +835,30 @@ impl AllocatorEngine {
             AllocatorEngine::Knuth(ctl) => ctl.allocator.print_free_block().join("\n"),
             AllocatorEngine::Buddy(ctl) => ctl.free_lists(order),
             AllocatorEngine::Slab(_) => "NOT_SUPPORTED".to_string(),
+            AllocatorEngine::ThreadLocalCache(_) => "NOT_SUPPORTED".to_string()
         }
     }
 
-    pub fn stats(&self, name: String) -> String {
+    pub fn stats(&self, name: Option<String>, class: Option<i32>) -> String {
         match self {
             AllocatorEngine::Knuth(ctl) => ctl.allocator.stats().join("\n"),
             AllocatorEngine::Buddy(_) => "NOT_SUPPORTED".to_string(),
             AllocatorEngine::Slab(caches) => {
-                if let Some(allocator) = caches.get(&name) {
-                    allocator.stats(name)
+                if let Some(name) = name {
+                    if let Some(allocator) = caches.get(&name) {
+                        allocator.stats(name)
+                    } else {
+                        "BAD".to_string()
+                    }
                 } else {
-                    "BAD".to_string()
+                    "MISSING_NAME_PARAM".to_string()
+                }
+            },
+            AllocatorEngine::ThreadLocalCache(ctl) => {
+                if let Some(class) = class {
+                    ctl.stats(class).join("\n")
+                } else {
+                    "MISSING_CLASS_PARAM".to_string()
                 }
             }
         }
@@ -793,6 +882,9 @@ const FOOTER_SIZE: i32       = 8;
 const MIN_SPLIT: i32         = 16; // Minimum remaining size of unued block memory that determines split.
 const OVERHEAD: i32          = HEADER_SIZE + FOOTER_SIZE;
 const DEFAULT_HEAP_SIZE: i32 = 1024;
+const CACHE_MAX: usize       = 5;
+const BATCH: usize           = 4;
+const HALF: usize            = 3;
 
 fn main() {
     let stdin = io::stdin();
@@ -847,10 +939,19 @@ fn main() {
                     result.push(eng.alloc(number, None));
                 }*/
                 // -- SLAB
-                let cache_name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());
+                /*let cache_name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());
                 if let Some(eng) = &mut engine {
-                    result.push(eng.alloc(None, cache_name));
-                }
+                    result.push(eng.alloc(None, cache_name, None, None));
+                }*/
+                // THREAD-CACHE
+                let tid: Option<i32>   = expression.next().and_then(|t| t.parse().ok());
+                let class: Option<i32> = expression.next().and_then(|c| c.parse().ok());
+                // Lazy init the engine
+                let eng = engine.get_or_insert_with(|| {
+                    AllocatorEngine::ThreadLocalCache(ThreadCacheManager::new())
+                });
+
+                result.push(eng.alloc(None, None, tid, class));
                 // Decide whether to reuse or bump
                 // --- WHEN WE DONT TAKE INTO ACCOUNT FREE BLOCKS AS FIRST
                 /*if let Some(addr) = reused_block_addr {
@@ -877,10 +978,10 @@ fn main() {
                         bump += block_total;
                     }
                 }
-                }*/ else {
+                } else {
                     println!("Inappropriate value for instruction ALLOC");
                     return;
-                }
+                }*/
             }
             Some(AllowedInstructions::USED) => {
                 let number: Option<i32> = if let Some(s) = expression.next() {
@@ -923,12 +1024,20 @@ fn main() {
                     result.push(eng.free(number, None, None, None));
                 }*/
                 // SLAB
-                let cache_name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());
+                /*let cache_name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());
                 let sid: Option<usize> = expression.next().and_then(|n| n.parse().ok());
                 let slot: Option<usize> = expression.next().and_then(|n| n.parse().ok());
                 if let Some(eng) = &mut engine {
-                    result.push(eng.free(None, cache_name, sid, slot))
-                }
+                    result.push(eng.free(None, cache_name, sid, slot, None, None))
+                }*/
+                // THREAD-CACHE
+                let tid: Option<i32> = expression.next().and_then(|t| t.parse().ok());
+                let class: Option<i32> = expression.next().and_then(|c| c.parse().ok());
+                let eng = engine.get_or_insert_with(|| {
+                    AllocatorEngine::ThreadLocalCache(ThreadCacheManager::new())
+                });
+                result.push(eng.free(None, None, None, None, tid, class));
+                
                 // Content from previous tests may help in the future
                 /*if let Some(val) = number {
                     let mut found: bool = false;
@@ -997,10 +1106,15 @@ fn main() {
                     result.push(ctl.allocator.stats());
                 }*/
                 // SLAB
-                let cache_name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());
-                if let (Some(eng), Some(cache_name)) = (&engine, cache_name.as_ref()) {
-                    result.push(eng.stats(cache_name.clone()))
-                }
+                /*let cache_name: Option<String> = expression.next().and_then(|s| s.trim().parse().ok());
+                if let (Some(eng), Some(cache_name)) = (&engine, cache_name) {
+                    result.push(eng.stats(cache_name))
+                }*/
+                // THREAD-CACHE
+                let tid = expression.next().and_then(|t| t.parse().ok());
+                if let Some(eng) = &engine {
+                    result.push(eng.stats(None, tid))
+                } 
             }
             Some(AllowedInstructions::ORDER) => {
                 let number: Option<i32> = if let Some(s) = expression.next() {
