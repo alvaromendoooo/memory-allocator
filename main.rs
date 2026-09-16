@@ -219,7 +219,7 @@ impl AllocatorsWorkload {
                 allocator: "slab".to_string(),
             },
             WorkloadRule {
-                patterns: vec!["multi-thread".to_string(), "thread-per-request".to_string(), "web server".to_string(), "tcmalloc".to_string()],
+                patterns: vec!["multi-thread*".to_string(), "thread-per-request".to_string(), "web server".to_string(), "tcmalloc".to_string()],
                 allocator: "tcmalloc".to_string(),
             },
             WorkloadRule {
