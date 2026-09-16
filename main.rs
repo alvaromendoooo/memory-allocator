@@ -97,7 +97,8 @@ pub struct Class {
 pub struct Allocator {
     pub blocks: Vec<MemoryBlock>,
     pub class: Class,
-    pub internal_frag: i32,
+    //pub internal_frag: i32, - Not dealing with internal_frag now
+    pub bump: i32,
 }
 
 // Definition of memory strategy allocator manager for Knuth algorithm - Controls ALLOC depending of the strat
@@ -535,7 +536,7 @@ impl FitStratController {
 impl Class {
     // New instace
     pub fn new() -> Self {
-        let sizes =  vec![16, 32, 64, 128, 256, 512, 1024];
+        let sizes =  vec![16, 32, 64, 128, 256, 512, 1024, 2048];
         let len = sizes.len();
         Self {
             sizes,
@@ -552,7 +553,8 @@ impl Allocator {
         Self {
             blocks: Vec::new(),
             class: class_instance,
-            internal_frag: 0,
+            //internal_frag: 0,
+            bump: 0,
         }
     }
 
@@ -571,7 +573,8 @@ impl Allocator {
         Self {
             blocks: vec![initial_free_block],
             class: class_instance,
-            internal_frag: 0,
+            //internal_frag: 0,
+            bump: 0,
         }
     }
 
@@ -610,7 +613,6 @@ impl Allocator {
         if request_size > DEFAULT_HEAP_SIZE {
             return Err("OOM")
         }
-
         if let Some(idx) = block_idx {
             // Resolve class size
             let class_idx = match self.get_class_index(request_size) {
@@ -619,11 +621,12 @@ impl Allocator {
             };
             
             let class_val = self.class.sizes[class_idx];
-            let wasted_space = class_val - request_size;
-            self.internal_frag += wasted_space;
+            //let wasted_space = class_val - request_size;
+            //self.internal_frag += wasted_space;
             //calculate the total footprint of the newly allocated block (payload + tags) - taking
             //into account that if request_size = 10 and is included in class 16, the size is 16 not 10
             //let used_block_footprint = class_val + OVERHEAD; - KNUTH original
+            self.bump += class_val;
 
 
             let block = &mut self.blocks[idx]; // It's gonna be updated
@@ -670,7 +673,6 @@ impl Allocator {
                     self.class.free_count[class_idx] -= 1;
                 }
             }
-            
             Ok(original_data_addr)
         } else {
             Err("OOM")
@@ -678,32 +680,38 @@ impl Allocator {
     }
 
     // Frees used blocks of memory from data_adress
-    pub fn free(&mut self, received_class: i32) -> Result<&'static str, &'static str> {
+    pub fn free(&mut self, received_address: i32) -> Result<&'static str, &'static str> {
         let mut found = false;
-        
+        let mut block_found = None;
         for block in self.blocks.iter_mut() {
-            if block.status == Status::Used && block.data_address == received_class {
+            if block.status == Status::Used && block.data_address == received_address {
                 block.status = Status::Free;
+                block_found = Some(block);
                 found = true;
                 // If removed alloc block, substract internal frag from that block
-                if let Some(c) = block.class {
+                /*if let Some(c) = block.class {
                     if self.internal_frag > 0 {
                         self.internal_frag -= c - block.req_size;
                     }
-                }
+                }*/ // UNCOMMENT when using internal_frag
                 break;
             }
         }
 
         if found {
-            if let Some(idx) = self.class.sizes.iter().position(|&s| s == received_class) {
-                self.class.free_count[idx]  += 1;
-                self.class.alloc_count[idx] -= 1;
+            if let Some(block_class) = block_found.unwrap().class {
+                if let Some(idx) = self.class.sizes.iter().position(|&s| s == block_class) {
+                    self.class.free_count[idx]  += 1;
+                    self.class.alloc_count[idx] -= 1;
+                    self.bump -= block_class;
+                }
+                    Ok("OK")
+                } else {
+                    Err("BAD")
+                }
+            } else {
+                Err("BAD")
             }
-            Ok("OK")
-        } else {
-            Err("BAD")
-        }
     }
 
     // Prints free blocks
@@ -781,8 +789,9 @@ impl Allocator {
             let allocators = self.class.alloc_count[i];
             let frees      = self.class.free_count[i];
 
-            info_classes_stringify.push(format!("{}:alloc={}:free={}", class_size, allocators, frees));
+            info_classes_stringify.push(format!("class={} alloc={} free={}", class_size, allocators, frees));
         }
+        info_classes_stringify.push(format!("bump={}/{}", self.bump, DEFAULT_HEAP_SIZE));
         info_classes_stringify
     }
 
@@ -814,7 +823,7 @@ impl Allocator {
         };
 
         format!("used={} free={} free_blocks={} largest_free={} internal_frag={} external_frag={:.4}",
-            total_used, total_free, free_blocks_count, largest_free, self.internal_frag, external_frag)
+            total_used, total_free, free_blocks_count, largest_free, 0, external_frag)
     }
 }
 
@@ -1014,11 +1023,21 @@ pub fn lazy_cotroller_init(
     })
 }
 
+pub fn lazy_engine_init<'a>(
+    engine: &'a mut Option<AllocatorEngine>,
+    class: Class) -> &'a mut AllocatorEngine {
+    
+    engine.get_or_insert_with(|| {
+        let allocator = Allocator::init(DEFAULT_HEAP_SIZE, class);
+        AllocatorEngine::Knuth(FitStratController::new(allocator, FitStrategies::FIRST))
+    })
+}
+
 const HEADER_SIZE: i32       = 8; // In this memory allocator, the header size is only 8
 const FOOTER_SIZE: i32       = 8;
 const MIN_SPLIT: i32         = 16; // Minimum remaining size of unued block memory that determines split.
 const OVERHEAD: i32          = 0; // HEADER_SIZE + FOOTER_SIZE if head + foot implemented
-const DEFAULT_HEAP_SIZE: i32 = 1024;
+const DEFAULT_HEAP_SIZE: i32 = 32768; // 32 KB
 const CACHE_MAX: usize       = 5;
 const BATCH: usize           = 4;
 const HALF: usize            = 3;
@@ -1028,7 +1047,7 @@ fn main() {
     let mut bump = 0; // Initialize dump controller
     let mut result: Vec<String> = Vec::new(); // Initialize result vector that will contain partial solutions
     let mut engine: Option<AllocatorEngine> = None;
-    let allocator_workload = AllocatorsWorkload::init();
+    //let allocator_workload = AllocatorsWorkload::init();
     // initialization
     //let mut allocator = Allocator::new(); // Vector that will registry memory blocks
     // in memory
@@ -1037,9 +1056,10 @@ fn main() {
         if l.is_empty() { continue; }
 
         // Definition of the type of allocator needed to the requirements received
-        result.push(allocator_workload.match_pattern(l.as_str()));
+        //result.push(allocator_workload.match_pattern(l.as_str()));
+        //println!("{:?}", result);
 
-        /*let mut expression = l.split_whitespace(); // Get expression input
+        let mut expression = l.split_whitespace(); // Get expression input
         // separated into whitespaces
         let instruction: Option<AllowedInstructions> = expression
             .next()
@@ -1072,8 +1092,11 @@ fn main() {
             Some(AllowedInstructions::ALLOC) => {
                 // Knuth
                 let size: Option<i32> = expression.next().and_then(|s| s.trim().parse().ok());
-                if let Some(eng) = &mut engine {
+                let class = Class::new();
+                if let Some(req_size) = size {
+                    let eng = lazy_engine_init(&mut engine, class);
                     result.push(eng.alloc(size, None, None, None));
+                    //println!("{:?}", result);
                 }
                 // BUDDY
                 /*let number: Option<i32> = if let Some(s) = expression.next() {
@@ -1162,9 +1185,11 @@ fn main() {
             Some(AllowedInstructions::FREE) => {
                 // Knuth
                 let addr: Option<i32> = expression.next().and_then(|s| s.trim().parse().ok());
-                if let Some(eng) = &mut engine {
-                    result.push(eng.free(addr, None, None, None, None, None));
-                }
+                let class = Class::new();
+                
+                let eng = lazy_engine_init(&mut engine, class);
+                result.push(eng.free(addr, None, None, None, None, None));
+                
                 // BUDYY
                 /*let number: Option<i32> = if let Some(s) = expression.next() {
                     s.trim().parse::<i32>().ok()
@@ -1263,10 +1288,14 @@ fn main() {
                     result.push(eng.stats(cache_name))
                 }*/
                 // THREAD-CACHE
-                let tid = expression.next().and_then(|t| t.parse().ok());
+                /*let tid = expression.next().and_then(|t| t.parse().ok());
                 if let Some(eng) = &engine {
                     result.push(eng.stats(None, tid))
-                } 
+                }*/
+
+                if let Some(AllocatorEngine::Knuth(ctl)) = &engine {
+                    result.extend(ctl.allocator.stats());
+                }
             }
             Some(AllowedInstructions::ORDER) => {
                 let number: Option<i32> = if let Some(s) = expression.next() {
@@ -1322,8 +1351,8 @@ fn main() {
                     result.push(ctl.allocator.report());
                 }
             }
-            None => println!("Invalid or missing instruction"),
-        }*/
+            None => { println!("Invalid or missing instruction"); break; },
+        }
     }
     for value in result.iter() {
         println!("{}", value);
