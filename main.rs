@@ -29,6 +29,15 @@ pub enum AllowedInstructions {
     REPORT,
 }
 
+#[derive(Debug)]
+pub enum AvailableAllocators {
+    BUMP,
+    SLAB,
+    TCMALLOC,
+    ARENA,
+    DEFAULT
+}
+
 #[derive(Debug, PartialEq)]
 pub enum FitStrategies {
     FIRST,
@@ -45,6 +54,9 @@ pub enum Status {
 // Concret struct to handle parsing str->enum errors
 #[derive(Debug)]
 pub struct ParseInstructionError;
+
+#[derive(Debug)]
+pub struct ParseAllocatorSelectedError;
 
 // Definition of memory block components
 #[derive(Debug, Clone)]
@@ -124,6 +136,18 @@ pub struct ThreadCacheManager {
     pub threads: HashMap<i32, BTreeMap<i32, usize>>,
 }
 
+#[derive(Debug)]
+pub struct WorkloadRule {
+    pub patterns: Vec<String>,
+    pub allocator: String,
+}
+
+// Definition of available allocator workloads per pattern description
+#[derive(Debug)]
+pub struct AllocatorsWorkload {
+    pub rules: Vec<WorkloadRule> 
+}
+
 // Mapper that converts input str into enum for match iteration control
 impl FromStr for AllowedInstructions {     
 
@@ -131,7 +155,7 @@ impl FromStr for AllowedInstructions {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_uppercase().as_str() {
-            "INIT" => Ok(AllowedInstructions::INIT),
+            "INIT"         => Ok(AllowedInstructions::INIT),
             "ALLOC"        => Ok(AllowedInstructions::ALLOC),
             "USED"         => Ok(AllowedInstructions::USED),
             "RESET"        => Ok(AllowedInstructions::RESET),
@@ -150,6 +174,23 @@ impl FromStr for AllowedInstructions {
     }
 }
 
+// Mapper converting allocato workload selection string into enum for future match iteration control
+impl FromStr for AvailableAllocators {
+
+    type Err = ParseAllocatorSelectedError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_uppercase().as_str() {
+            "BUMP"     => Ok(AvailableAllocators::BUMP),
+            "SLAB"     => Ok(AvailableAllocators::SLAB),
+            "TCMALLOC" => Ok(AvailableAllocators::TCMALLOC),
+            "ARENA"    => Ok(AvailableAllocators::ARENA),
+            "DEFAULT"  => Ok(AvailableAllocators::DEFAULT),
+            _          => Err(ParseAllocatorSelectedError),
+        }
+    }
+}
+
 // Mapper that converts input str into enum for match strategy control
 impl FromStr for FitStrategies {
     type Err = ParseInstructionError;
@@ -161,6 +202,45 @@ impl FromStr for FitStrategies {
             "WORST" => Ok(FitStrategies::WORST),
             _       => Err(ParseInstructionError),
         }
+    }
+}
+
+// Functionalities for available allocators workloads
+impl AllocatorsWorkload {
+    pub fn init() -> Self {
+
+        let rules = vec![
+            WorkloadRule {
+                patterns: vec!["never free".to_string(), "one-shot".to_string(), "bump".to_string()],
+                allocator: "bump".to_string(),
+            },
+            WorkloadRule {
+                patterns: vec!["kernel".to_string(), "dentry".to_string(), "inode".to_string(), "fixed-type".to_string()],
+                allocator: "slab".to_string(),
+            },
+            WorkloadRule {
+                patterns: vec!["multi-thread".to_string(), "thread-per-request".to_string(), "web server".to_string(), "tcmalloc".to_string()],
+                allocator: "tcmalloc".to_string(),
+            },
+            WorkloadRule {
+                patterns: vec!["per-frame".to_string(), "request handler".to_string(), "parser".to_string()],
+                allocator: "arena".to_string()
+            }
+        ];
+        Self { rules }
+    }
+
+    pub fn match_pattern(&self, input: &str) -> String {
+        let input_lower = input.to_lowercase();
+
+        for rule in &self.rules {
+            for pattern in &rule.patterns {
+                if input_lower.contains(pattern) {
+                    return rule.allocator.to_string();
+                }
+            }
+        }
+        "default".to_string()
     }
 }
 
@@ -948,13 +1028,18 @@ fn main() {
     let mut bump = 0; // Initialize dump controller
     let mut result: Vec<String> = Vec::new(); // Initialize result vector that will contain partial solutions
     let mut engine: Option<AllocatorEngine> = None;
+    let allocator_workload = AllocatorsWorkload::init();
     // initialization
     //let mut allocator = Allocator::new(); // Vector that will registry memory blocks
     // in memory
     for line in stdin.lock().lines() {
         let l = line.unwrap();
         if l.is_empty() { continue; }
-        let mut expression = l.split_whitespace(); // Get expression input
+
+        // Definition of the type of allocator needed to the requirements received
+        result.push(allocator_workload.match_pattern(l.as_str()));
+
+        /*let mut expression = l.split_whitespace(); // Get expression input
         // separated into whitespaces
         let instruction: Option<AllowedInstructions> = expression
             .next()
@@ -1238,7 +1323,7 @@ fn main() {
                 }
             }
             None => println!("Invalid or missing instruction"),
-        }
+        }*/
     }
     for value in result.iter() {
         println!("{}", value);
