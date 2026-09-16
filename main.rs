@@ -501,8 +501,16 @@ impl FitStratController {
 
     // First fit strategy
     pub fn alloc_first_fit(&mut self, size: i32) -> Result<i32, &'static str> {
+        let class_idx = match self.allocator.get_class_index(size) {
+            Some(c) => c,
+            None => return Err("OOM"),
+        };
+        let target_class = self.allocator.class.sizes[class_idx];
+
+        // Find a free block that exactly matches the requested class size, 
+        // or fall back to the large initial free heap block at the tail.
         let block_idx = self.allocator.blocks.iter().position(|b| {
-            b.status == Status::Free && b.size >= size
+            b.status == Status::Free && (b.size == target_class || b.size > 2048)
         });
 
         self.allocator.alloc_by_idx(size, block_idx)
@@ -626,13 +634,15 @@ impl Allocator {
             //calculate the total footprint of the newly allocated block (payload + tags) - taking
             //into account that if request_size = 10 and is included in class 16, the size is 16 not 10
             //let used_block_footprint = class_val + OVERHEAD; - KNUTH original
-            self.bump += class_val;
 
 
             let block = &mut self.blocks[idx]; // It's gonna be updated
             let original_data_addr = block.data_address;
             let original_data_size = block.size;
             //let original_data_size = class_val;
+            if original_data_addr + class_val > self.bump {
+                self.bump = original_data_addr + class_val;
+            }
             
             if original_data_size >= class_val + MIN_SPLIT {
                 // split initial free block into used + free blocks
@@ -681,13 +691,11 @@ impl Allocator {
 
     // Frees used blocks of memory from data_adress
     pub fn free(&mut self, received_address: i32) -> Result<&'static str, &'static str> {
-        let mut found = false;
-        let mut block_found = None;
+        let mut block_class = None;
         for block in self.blocks.iter_mut() {
             if block.status == Status::Used && block.data_address == received_address {
                 block.status = Status::Free;
-                block_found = Some(block);
-                found = true;
+                block_class = block.class;
                 // If removed alloc block, substract internal frag from that block
                 /*if let Some(c) = block.class {
                     if self.internal_frag > 0 {
@@ -698,20 +706,17 @@ impl Allocator {
             }
         }
 
-        if found {
-            if let Some(block_class) = block_found.unwrap().class {
-                if let Some(idx) = self.class.sizes.iter().position(|&s| s == block_class) {
-                    self.class.free_count[idx]  += 1;
+        if let Some(class_val) = block_class {
+            if let Some(idx) = self.class.sizes.iter().position(|&s| s == class_val) {
+                if self.class.alloc_count[idx] > 0 {
                     self.class.alloc_count[idx] -= 1;
-                    self.bump -= block_class;
                 }
-                    Ok("OK")
-                } else {
-                    Err("BAD")
-                }
-            } else {
-                Err("BAD")
+                self.class.free_count[idx] += 1;
             }
+            Ok("OK")
+        } else {
+            Err("BAD")
+        }
     }
 
     // Prints free blocks
